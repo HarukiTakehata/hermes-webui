@@ -98,13 +98,16 @@ logger = logging.getLogger(__name__)
 # short hard cap and graceful degradation.
 CUSTOM_MODELS_ENDPOINT_TIMEOUT_SECONDS = 5.0
 
-# Smallest slice ``_CustomProbeSchedule`` will hand a probe: a zero (or negative)
-# timeout means "non-blocking" to urllib, so a probe that is legitimately still in
-# flight would be reported as an instant connection failure. This is a guard rail
-# for the arithmetic — deliberately tiny, and NOT a per-probe minimum, because a
-# real floor would let a long chain of dead endpoints spend past the rebuild
-# window and recreate exactly the starvation this schedule exists to prevent.
-CUSTOM_MODELS_MIN_PROBE_TIMEOUT_SECONDS = 0.01
+# Attempt-only timeout for a probe that ``_CustomProbeSchedule`` reaches *after*
+# the shared rebuild window is already spent while the foreground caller is still
+# waiting — the narrow hand-off race described on ``next_timeout``. It is NOT a
+# per-probe minimum and NOT a share of the window: by the time it applies the
+# window is already gone, so nothing is being divided out of it, and it can never
+# be handed out on the fair-share path. Not zero, because urllib reads a zero
+# timeout as "non-blocking" and would report a probe that is genuinely still in
+# flight as an instant connection failure. The full per-endpoint cap is reserved
+# for the deliberately out-of-band continuation, never for this state.
+CUSTOM_MODELS_ATTEMPT_ONLY_TIMEOUT_SECONDS = 0.01
 
 
 def _env_mb_bytes(name: str, default_mb: int) -> int:
@@ -5335,13 +5338,20 @@ class _CustomProbeSchedule:
     This schedule hands each probe a fair slice of the *remaining* budget rather
     than letting it consume the whole cap, so an endpoint that times out cannot
     starve the endpoints after it. Two cases intentionally keep the historical
-    unthrottled cap:
+    unthrottled cap, and both are stated rather than inferred:
 
     * the legacy unbounded path (``_LIVE_REBUILD_BUDGET_SECONDS <= 0``), where
       there is no window to share;
     * the out-of-band continuation, i.e. the rebuild worker still running after
-      the foreground caller already gave up — its probes are no longer holding
-      anyone up and must keep their full attempt so the refresh can complete.
+      the foreground caller already gave up — reported by the ``out_of_band``
+      predicate — whose probes are no longer holding anyone up and must keep
+      their full attempt so the refresh can complete.
+
+    The window itself is never over-allocated: a slice is ``left / (remaining +
+    1)`` with **no lower bound**, because any fixed floor makes the chain's total
+    grow with the number of probes — and ``custom_providers`` has no count limit,
+    so a long enough chain of dead endpoints would again spend past the window and
+    push the reachable providers behind it out of the in-band rebuild.
 
     The trade-off to know about: slices shrink as the chain grows, because the
     window is fixed and shared. A slow-but-reachable endpoint sitting in a long
@@ -5353,10 +5363,11 @@ class _CustomProbeSchedule:
     rather than the over-budget fallback.
     """
 
-    def __init__(self, endpoint_count: int) -> None:
+    def __init__(self, endpoint_count: int, *, out_of_band=None) -> None:
         self._remaining = max(1, int(endpoint_count))
         self._cap = float(CUSTOM_MODELS_ENDPOINT_TIMEOUT_SECONDS)
-        self._min = float(CUSTOM_MODELS_MIN_PROBE_TIMEOUT_SECONDS)
+        self._attempt_only = float(CUSTOM_MODELS_ATTEMPT_ONLY_TIMEOUT_SECONDS)
+        self._out_of_band = out_of_band
         self._deadline = (
             time.monotonic() + float(_LIVE_REBUILD_BUDGET_SECONDS)
             if _LIVE_REBUILD_BUDGET_SECONDS > 0
@@ -5367,19 +5378,38 @@ class _CustomProbeSchedule:
         """Timeout for the next probe in the chain, then advance the schedule."""
         remaining = self._remaining
         self._remaining = max(1, remaining - 1)
+        # Legacy unbounded path: no window exists, so there is nothing to share.
         if self._deadline is None:
+            return self._cap
+        # Deliberately out-of-band continuation: the foreground caller has already
+        # stopped waiting and served its fallback, so this chain is no longer
+        # holding anyone up and keeps the full attempt for the refresh to be able
+        # to complete. This is an explicit signal rather than an inference from
+        # the deadline, because the deadline being spent does NOT imply the
+        # foreground has given up — a probe can find the window spent while the
+        # caller is still waiting (the hand-off race handled below), and that
+        # state has to stay bounded.
+        if self._out_of_band is not None and self._out_of_band():
             return self._cap
         left = self._deadline - time.monotonic()
         if left <= 0:
-            return self._cap
+            # In-band, window already spent: attempt the probe with the smallest
+            # workable timeout instead of the full cap. Handing out the cap here
+            # is what let a long chain outspend the window once its early slices
+            # were floored up — the later probes paid a full per-endpoint cap each
+            # after the window was gone, so a reachable provider behind them still
+            # landed out-of-band (or not at all), which is the reported defect.
+            return min(self._cap, self._attempt_only)
         # ``remaining + 1`` reserves one slot of headroom, so a chain of N probes
         # can spend at most N/(N+1) of the window and always finishes inside it —
         # which is what keeps the foreground caller on a published catalog rather
-        # than the over-budget fallback. Clamping the guard against ``left`` keeps
-        # that true at every chain length: a probe can never be handed more time
-        # than the window has left, so the floor can't defeat the headroom.
-        slice_seconds = left / (remaining + 1)
-        return min(self._cap, max(slice_seconds, min(self._min, left)))
+        # than the over-budget fallback. Deliberately NO lower bound on the slice:
+        # a fixed floor (0.5s, then 0.01s in earlier revisions) made the chain's
+        # cumulative spend grow with the endpoint count, so an unbounded
+        # ``custom_providers`` list could still exhaust the window before the
+        # later providers were reached. A positive ``left`` always divides to a
+        # positive slice, so there is nothing left to guard against here.
+        return min(self._cap, left / (remaining + 1))
 
 
 # ── Budget-exceeded warning rate-limit ───────────────────────────────────────
@@ -6980,6 +7010,21 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
     # ── COLD PATH helper ─────────────────────────────────────────────────────
     # Extracted so it runs inside _available_models_cache_lock (RLock) to
     # prevent thundering-herd: only one thread rebuilds while others wait.
+    #
+    # #7481: explicit foreground-vs-out-of-band signal for the probe schedule.
+    # The bounded path below runs the rebuild on a daemon worker and lets the
+    # foreground caller stop waiting at the budget; from that moment the worker's
+    # remaining probes are out-of-band and keep the full per-endpoint cap so the
+    # refresh can complete. That is a *different* contract from the in-band chain,
+    # which must stay inside the shared window — and the two cannot be told apart
+    # by the deadline alone (a probe can find the window spent while the caller is
+    # still waiting). The foreground sets this event when it gives up; every
+    # rebuild invocation gets its own, so a still-running worker from an earlier
+    # rebuild cannot read a later caller's state. Defined before the builder
+    # closure so the closure can capture it as a free variable; on the legacy
+    # synchronous path it is simply never set and there is no window to share.
+    _models_rebuild_abandoned = threading.Event()
+
     def _build_available_models_uncached() -> dict:
         active_provider = None
         default_model = get_effective_default_model(cfg)
@@ -7648,7 +7693,10 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                 count += 1
             return count
 
-        custom_probe_schedule = _CustomProbeSchedule(_pending_custom_probe_count())
+        custom_probe_schedule = _CustomProbeSchedule(
+            _pending_custom_probe_count(),
+            out_of_band=_models_rebuild_abandoned.is_set,
+        )
 
         # 4. Fetch models from custom endpoint if base_url is configured
         auto_detected_models = []
@@ -8866,10 +8914,13 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
             return copy.deepcopy(box["result"])
 
         # Budget elapsed. Mark it so the worker knows it owns out-of-band
-        # publication. Handle the tiny race where the build completed between
-        # wait() returning False and here: if so, still publish synchronously
-        # so this caller honours the cache contract.
+        # publication, and so the probe schedule hands its remaining probes the
+        # full per-endpoint cap instead of a share of a window nobody is waiting
+        # on any more (#7481). Handle the tiny race where the build completed
+        # between wait() returning False and here: if so, still publish
+        # synchronously so this caller honours the cache contract.
         budget_exceeded.set()
+        _models_rebuild_abandoned.set()
         if build_done.is_set() and "error" not in box and "result" in box:
             if _claim_publish():
                 _publish_models_result(box["result"], rebuild_seq=rebuild_seq)

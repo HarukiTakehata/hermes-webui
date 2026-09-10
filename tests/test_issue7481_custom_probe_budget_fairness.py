@@ -23,6 +23,7 @@ from __future__ import annotations
 import copy
 import json
 import socket
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -217,7 +218,11 @@ def test_unreachable_lan_active_endpoint_does_not_starve_the_gateway_behind_it(
     # bounded slice rather than the whole window.
     assert len(observed["dead"]) == 2
     for _url, timeout in observed["dead"]:
-        assert timeout is not None and timeout < _CAP
+        assert timeout is not None and 0 < timeout < _CAP
+    # The reachable provider was probed in-band off the same window, so its probe
+    # is bounded by the remaining budget too rather than the per-endpoint cap.
+    for _url, timeout in observed["live"]:
+        assert timeout is not None and 0 < timeout < _CAP
 
 
 def test_every_dead_endpoint_in_the_chain_still_lets_the_live_one_through(
@@ -319,13 +324,21 @@ def test_probe_schedule_shares_the_window_and_reserves_headroom(monkeypatch):
     assert clock.now < 4.0, timeouts
 
 
-def test_probe_schedule_cannot_outspend_the_window_at_any_chain_length(monkeypatch):
+@pytest.mark.parametrize("endpoint_count", [1, 2, 8, 24, 401, 1000])
+def test_probe_schedule_cannot_outspend_the_window_at_any_chain_length(
+    endpoint_count, monkeypatch
+):
     """The headroom must survive long chains — `custom_providers` is unbounded.
 
-    Regression guard for the review finding on the first revision: a fixed 0.5s
-    per-probe floor let eight timeouts spend the whole four-second window and
-    nine spend past it, so a long chain of dead endpoints could still push a
-    reachable provider out of the in-band rebuild.
+    Regression guard for both earlier revisions. A fixed 0.5s per-probe floor let
+    eight timeouts spend the whole four-second window and nine spend past it. The
+    0.01s "arithmetic guard" that replaced it was still a floor: with a computed
+    share below it, roughly the first 400 probes of a thousand could drain the
+    window and every probe after that was handed the full per-endpoint cap. Either
+    way a long chain of dead endpoints could push a reachable provider out of the
+    in-band rebuild — the reported defect — so the counts here run past both
+    thresholds, and the assertion is made after *every* allocation rather than
+    only at the end of the chain.
     """
     monkeypatch.setattr(cfg, "_LIVE_REBUILD_BUDGET_SECONDS", 4.0, raising=False)
     monkeypatch.setattr(cfg, "CUSTOM_MODELS_ENDPOINT_TIMEOUT_SECONDS", 5.0, raising=False)
@@ -333,23 +346,101 @@ def test_probe_schedule_cannot_outspend_the_window_at_any_chain_length(monkeypat
     clock = _FakeClock()
     monkeypatch.setattr(cfg, "time", clock, raising=False)
 
-    for endpoint_count in (1, 2, 8, 24):
-        clock.now = 0.0
-        schedule = cfg._CustomProbeSchedule(endpoint_count)
-        for _ in range(endpoint_count):
-            clock.now += schedule.next_timeout()  # every probe burns its slice
-        assert clock.now < 4.0, (endpoint_count, clock.now)
+    schedule = cfg._CustomProbeSchedule(endpoint_count)
+    for probe in range(endpoint_count):
+        timeout = schedule.next_timeout()
+        # Every slot is still attempted — including the last of a very long chain
+        # — and none of them is handed the full cap out of the shared window.
+        assert 0 < timeout < 5.0, (endpoint_count, probe, timeout)
+        clock.now += timeout  # every probe burns its slice
+        # Cumulative spend never reaches the window, so the chain always finishes
+        # in-band and the foreground caller gets a published catalog.
+        assert clock.now < 4.0, (endpoint_count, probe, clock.now)
 
 
-def test_probe_schedule_restores_the_cap_once_the_budget_is_spent(monkeypatch):
+def test_probe_schedule_restores_the_cap_once_the_foreground_gives_up(monkeypatch):
     """The out-of-band continuation still gets a full attempt to refresh."""
     monkeypatch.setattr(cfg, "_LIVE_REBUILD_BUDGET_SECONDS", 0.05, raising=False)
     monkeypatch.setattr(cfg, "CUSTOM_MODELS_ENDPOINT_TIMEOUT_SECONDS", 5.0, raising=False)
 
-    schedule = cfg._CustomProbeSchedule(3)
+    abandoned = threading.Event()
+    schedule = cfg._CustomProbeSchedule(3, out_of_band=abandoned.is_set)
+
     assert schedule.next_timeout() < 5.0
     time.sleep(0.1)  # budget now spent
+    abandoned.set()  # the foreground caller has stopped waiting
     assert schedule.next_timeout() == 5.0
+
+
+def test_probe_schedule_stays_bounded_in_band_after_the_window_is_spent(monkeypatch):
+    """A spent window is not the same state as an out-of-band continuation.
+
+    Regression guard for the review finding on the second revision: the deadline
+    being spent said nothing about whether the foreground caller had given up, so
+    an in-band chain that had already outspent the window was handed the full
+    per-endpoint cap for each of its remaining probes — the window was bypassed
+    and whatever reachable provider sat behind it landed out-of-band (or not at
+    all), which is the reported defect. Only a caller that has actually stopped
+    waiting may spend past the window.
+    """
+    monkeypatch.setattr(cfg, "_LIVE_REBUILD_BUDGET_SECONDS", 0.05, raising=False)
+    monkeypatch.setattr(cfg, "CUSTOM_MODELS_ENDPOINT_TIMEOUT_SECONDS", 5.0, raising=False)
+
+    # No out-of-band signal: the caller is still waiting on this chain.
+    schedule = cfg._CustomProbeSchedule(3)
+
+    assert schedule.next_timeout() < 5.0
+    time.sleep(0.1)  # window spent while the foreground is still waiting
+    for _ in range(3):
+        timeout = schedule.next_timeout()
+        assert 0 < timeout < 5.0, timeout  # attempted, but never the full cap
+
+
+def test_probe_schedule_is_wired_to_the_foreground_giving_up(
+    monkeypatch, isolate_models_catalog_state
+):
+    """The schedule must see the real hand-off, not infer it from the deadline.
+
+    The over-budget continuation is recognised through an explicit signal; if a
+    rebuild never passed one, its probes would stay pinned to the window that the
+    caller already walked away from, and the out-of-band refresh could not
+    complete. This asserts the schedule is handed a signal, and that the signal
+    reports out-of-band once the foreground caller has stopped waiting.
+    """
+    _configure(monkeypatch, active_base_url=None)
+    monkeypatch.setattr(cfg, "_LIVE_REBUILD_BUDGET_SECONDS", 0.05, raising=False)
+
+    seen: dict = {}
+    real_schedule = cfg._CustomProbeSchedule
+    real_invoke = cfg._invoke_models_rebuild
+
+    class _RecordingSchedule(real_schedule):
+        def __init__(self, endpoint_count, *, out_of_band=None):
+            seen["predicate"] = out_of_band
+            super().__init__(endpoint_count, out_of_band=out_of_band)
+
+    monkeypatch.setattr(cfg, "_CustomProbeSchedule", _RecordingSchedule)
+
+    def _slow_builder(builder):
+        # Hold the worker past the budget so the foreground gives up before the
+        # probe chain is scheduled — the state the signal has to report.
+        time.sleep(0.15)
+        return real_invoke(builder)
+
+    monkeypatch.setattr(cfg, "_invoke_models_rebuild", _slow_builder)
+
+    cfg.get_available_models()
+
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline and "predicate" not in seen:
+        time.sleep(0.01)
+
+    assert seen.get("predicate") is not None, (
+        "the probe schedule was never given a foreground/out-of-band signal"
+    )
+    assert seen["predicate"]() is True, (
+        "the foreground gave up but the schedule still reads as in-band"
+    )
 
 
 def test_late_out_of_band_result_cannot_overwrite_a_newer_rebuild(

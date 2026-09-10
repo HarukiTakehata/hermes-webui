@@ -430,7 +430,7 @@ wall-clock budget:
 | --- | --- | --- |
 | `HERMES_WEBUI_MODELS_REBUILD_BUDGET` | `4` (seconds) | Window a foreground caller waits for a cold rebuild. `0` restores the legacy synchronous unbounded rebuild. |
 | `CUSTOM_MODELS_ENDPOINT_TIMEOUT_SECONDS` | `5.0` | Per-endpoint cap for a custom provider `/v1/models` probe. |
-| `CUSTOM_MODELS_MIN_PROBE_TIMEOUT_SECONDS` | `0.01` | Arithmetic guard against a zero timeout. Not a per-probe minimum — see below. |
+| `CUSTOM_MODELS_ATTEMPT_ONLY_TIMEOUT_SECONDS` | `0.01` | Attempt-only timeout for a probe reached after the window is already spent while the caller is still waiting. Not a per-probe minimum and not a slice — see below. |
 
 Within the window the rebuild behaves normally; past it the caller is served a fallback
 (last-known disk cache, else a network-free static catalog) while the worker keeps going so
@@ -443,18 +443,28 @@ slice of the *remaining* window instead of letting one probe take the whole per-
 cap, so an unreachable endpoint cannot leave the reachable providers behind it with no
 in-band probe at all (#7481).
 
-- Each slice is `min(cap, left / (remaining + 1))`. The `+1` reserves a slot of headroom,
-  so a chain of N probes can spend at most `N/(N+1)` of the window and always finishes
-  inside it — that is what keeps the foreground caller on a published catalog instead of
-  the over-budget fallback. The guard above is clamped against `left`, so no chain length
-  can outspend the window.
+- Each slice is `min(cap, left / (remaining + 1))`, with **no lower bound**. The `+1`
+  reserves a slot of headroom, so a chain of N probes can spend at most `N/(N+1)` of the
+  window and always finishes inside it — that is what keeps the foreground caller on a
+  published catalog instead of the over-budget fallback. A floor (however small) would make
+  the chain's cumulative spend grow with the endpoint count, and `custom_providers` has no
+  count limit, so a long enough chain of dead endpoints could again outspend the window and
+  push the reachable providers behind it out of the in-band rebuild.
+- The two states that keep the unthrottled per-endpoint cap are stated explicitly rather
+  than inferred from the clock, because a spent window says nothing about whether anyone is
+  still waiting:
+  - the legacy unbounded path (budget `0`), which has no window to share;
+  - the out-of-band continuation — the worker still probing after the foreground caller
+    gave up and served its fallback. It is recognised through an explicit signal (the
+    caller sets the event when it stops waiting) and is the only in-process state allowed
+    to spend past the window. The narrow race where a probe finds the window spent while
+    the caller *is* still waiting is not that state: it gets the attempt-only timeout
+    above, never the cap.
 - Trade-off to know about: slices shrink as the chain grows, because the window is fixed
   and shared. A slow-but-reachable endpoint in a long chain can be cut off; size
   `HERMES_WEBUI_MODELS_REBUILD_BUDGET` for the endpoints actually in use, or give a
   `custom_providers` entry a static `models:` allowlist so it is never probed live.
-- The legacy unbounded path (budget `0`) and the out-of-band continuation (window already
-  spent) keep the unthrottled per-endpoint cap, so their behaviour is unchanged. Probe
-  order, per-endpoint SSRF and authentication rules, and the per-endpoint cap are
+- Probe order, per-endpoint SSRF and authentication rules, and the per-endpoint cap are
   preserved.
 
 Publication is ordered by **generation, not by wall clock**. Each cold rebuild takes the
