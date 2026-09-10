@@ -7547,7 +7547,7 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
 
         def _custom_endpoint_error(
             provider: str,
-            exc: Exception,
+            exc: Exception | None = None,
             *,
             code: int | None = None,
         ) -> dict:
@@ -7571,6 +7571,44 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                 "message": f"Models endpoint unreachable for {provider_label}; verify base_url.",
             }
 
+        # ── In-rebuild probe de-duplication (#7481 follow-up) ────────────────
+        # One rebuild can consult the same endpoint more than once: step 4 probes
+        # the active ``model.base_url``, and the LM Studio provider-group fallback
+        # later reads ``providers.lmstudio.base_url`` (falling back to
+        # ``model.base_url`` when lmstudio is the active provider) — in the config
+        # shape the issue reports those are the SAME unreachable LAN host, so one
+        # dead endpoint cost the rebuild two full connect timeouts and two slots of
+        # the shared window. A named ``custom_providers`` entry can likewise repeat
+        # an endpoint an earlier entry already probed. Memoise by (endpoint URL,
+        # credential) and reuse the outcome, so an endpoint is probed at most once
+        # per rebuild.
+        #
+        # The credential is part of the identity: the same URL with a different key
+        # is a different probe and still runs. The raw payload is cached rather than
+        # the parsed entries, so each consumer still shapes the list for its own
+        # provider, and the memo is consulted only AFTER the per-endpoint
+        # SSRF/validation checks — a consumer that would have been blocked is still
+        # blocked rather than served another caller's result.
+        _custom_endpoint_probe_memo: dict[tuple[str, str], tuple[str, object]] = {}
+
+        def _custom_endpoint_probe_key(endpoint_url: str, headers: dict) -> tuple[str, str]:
+            """Identity of one custom-endpoint probe: the URL it hits + the credential it sends."""
+            parsed = urlparse(
+                str(endpoint_url) if "://" in str(endpoint_url) else f"http://{endpoint_url}"
+            )
+            scheme = (parsed.scheme or "http").lower()
+            host = (parsed.hostname or "").lower()
+            port = parsed.port
+            if port and port != (443 if scheme == "https" else 80):
+                host = f"{host}:{port}"
+            # Path comparison ignores repeated/leading/trailing slashes but keeps
+            # case: a path is case-sensitive, a host is not.
+            path = "/".join(seg for seg in (parsed.path or "").split("/") if seg)
+            return (
+                f"{scheme}://{host}/{path}",
+                str(headers.get("Authorization") or ""),
+            )
+
         def _read_custom_endpoint_models(
             base_url: object,
             provider: str,
@@ -7582,6 +7620,12 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
             base = str(base_url or "").strip()
             if not base:
                 return [], None
+            # Filled in once the endpoint has passed validation; the failure paths
+            # below memoize their outcome under it so a later consumer in the same
+            # rebuild does not pay the same timeout twice. It stays None when the
+            # validation refuses the URL, so a consumer that would have been blocked
+            # is never served another caller's memoized result.
+            probe_key: tuple[str, str] | None = None
             try:
                 import ipaddress
                 import urllib.error
@@ -7624,6 +7668,19 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                     except socket.gaierror:
                         pass
 
+                probe_key = _custom_endpoint_probe_key(endpoint_url, headers)
+                memoized = _custom_endpoint_probe_memo.get(probe_key)
+                if memoized is not None:
+                    # This exact endpoint + credential was already probed earlier in
+                    # this rebuild, so reuse the outcome rather than paying the
+                    # connect timeout a second time (#7481 follow-up). A memoized
+                    # failure is re-reported for THIS provider (its own label).
+                    memo_kind, memo_value = memoized
+                    if memo_kind == "ok":
+                        logger.debug("Reusing in-rebuild /models probe for %s", endpoint_url)
+                        return _extract_model_entries_from_payload(memo_value, provider), None
+                    return [], _custom_endpoint_error(provider, code=memo_value)
+
                 req = urllib.request.Request(endpoint_url, method="GET")
                 req.add_header("User-Agent", "OpenAI/Python 1.0")
                 for k, v in headers.items():
@@ -7639,13 +7696,20 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                 )
                 with urllib.request.urlopen(req, timeout=probe_timeout) as response:  # nosec B310
                     data = json.loads(response.read().decode("utf-8"))
+                if probe_key is not None:
+                    _custom_endpoint_probe_memo[probe_key] = ("ok", data)
                 return _extract_model_entries_from_payload(data, provider), None
             except urllib.error.HTTPError as exc:
-                error = _custom_endpoint_error(provider, exc, code=getattr(exc, "code", None))
+                response_code = getattr(exc, "code", None)
+                error = _custom_endpoint_error(provider, exc, code=response_code)
+                if probe_key is not None:
+                    _custom_endpoint_probe_memo[probe_key] = ("error", response_code)
                 logger.debug("Custom endpoint models fetch failed for provider %s: %s", provider, error)
                 return [], error
             except Exception as exc:
                 error = _custom_endpoint_error(provider, exc)
+                if probe_key is not None:
+                    _custom_endpoint_probe_memo[probe_key] = ("error", None)
                 logger.debug("Custom endpoint unreachable or misconfigured for provider %s: %s", provider, error)
                 return [], error
 
@@ -8306,24 +8370,57 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                                 headers["Authorization"] = f"Bearer {lm_api_key}"
                             endpoint = (lm_base_url + "/models").rstrip("/")
                             try:
-                                import urllib.request as _urlreq
-                                req = _urlreq.Request(endpoint, method="GET", headers=headers)
-                                # #7481: this probe is part of the same rebuild as
-                                # the custom-endpoint chain, so it draws from the
-                                # shared schedule instead of a hardcoded 5s that
-                                # could push the rebuild past the budget on its own.
-                                with _urlreq.urlopen(
-                                    req,
-                                    timeout=custom_probe_schedule.next_timeout(),
-                                ) as resp:
-                                    lm_data = json.loads(resp.read().decode())
+                                _lm_probe_key = _custom_endpoint_probe_key(endpoint, headers)
+                            except Exception:
+                                _lm_probe_key = None
+                            _lm_memo = (
+                                _custom_endpoint_probe_memo.get(_lm_probe_key)
+                                if _lm_probe_key is not None
+                                else None
+                            )
+                            lm_data = None
+                            if _lm_memo is not None:
+                                # #7481 follow-up: this endpoint was already probed
+                                # earlier in this rebuild — typically by the active
+                                # model.base_url probe, since
+                                # _get_provider_base_url("lmstudio") falls back to
+                                # model.base_url when lmstudio is the active
+                                # provider. Reuse that payload (or its failure)
+                                # instead of stalling on the same host a second
+                                # time, which is what made one dead LAN endpoint
+                                # cost the rebuild two connect timeouts.
+                                if _lm_memo[0] == "ok":
+                                    lm_data = _lm_memo[1]
+                                else:
+                                    logger.debug(
+                                        "LM Studio endpoint %s already failed in this rebuild; not re-probing",
+                                        endpoint,
+                                    )
+                            else:
+                                try:
+                                    import urllib.request as _urlreq
+                                    req = _urlreq.Request(endpoint, method="GET", headers=headers)
+                                    # #7481: this probe is part of the same rebuild as
+                                    # the custom-endpoint chain, so it draws from the
+                                    # shared schedule instead of a hardcoded 5s that
+                                    # could push the rebuild past the budget on its own.
+                                    with _urlreq.urlopen(
+                                        req,
+                                        timeout=custom_probe_schedule.next_timeout(),
+                                    ) as resp:
+                                        lm_data = json.loads(resp.read().decode())
+                                    if _lm_probe_key is not None:
+                                        _custom_endpoint_probe_memo[_lm_probe_key] = ("ok", lm_data)
+                                except Exception:
+                                    if _lm_probe_key is not None:
+                                        _custom_endpoint_probe_memo[_lm_probe_key] = ("error", None)
+                                    logger.debug("LM Studio /models fetch failed at %s", endpoint)
+                            if isinstance(lm_data, dict):
                                 for m in (lm_data.get("data") or []):
                                     if isinstance(m, dict):
                                         mid = str(m.get("id") or "").strip()
                                         if mid and {"id": mid, "label": mid} not in raw_models:
                                             raw_models.append({"id": mid, "label": mid})
-                            except Exception:
-                                logger.debug("LM Studio /models fetch failed at %s", endpoint)
 
                     if raw_models:
                         _append_picker_group(provider_name, pid, raw_models)

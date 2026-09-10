@@ -213,10 +213,12 @@ def test_unreachable_lan_active_endpoint_does_not_starve_the_gateway_behind_it(
     assert observed["live"], "the reachable named provider was never probed"
     assert _models_by_provider(catalog).get("custom:my-gateway") == _GATEWAY_MODELS
 
-    # Both consumers of the dead endpoint were attempted — the active-endpoint
-    # probe and the LM Studio provider-group fallback — and each was handed a
-    # bounded slice rather than the whole window.
-    assert len(observed["dead"]) == 2
+    # The dead endpoint is configured twice (active `model.base_url` and
+    # `providers.lmstudio.base_url`), but it is now probed ONCE per rebuild: the
+    # second consumer reuses the first outcome instead of paying the connect
+    # timeout again. Its single probe was still handed a bounded slice of the
+    # window rather than the whole per-endpoint cap.
+    assert len(observed["dead"]) == 1
     for _url, timeout in observed["dead"]:
         assert timeout is not None and 0 < timeout < _CAP
     # The reachable provider was probed in-band off the same window, so its probe

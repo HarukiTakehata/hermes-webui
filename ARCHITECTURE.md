@@ -464,6 +464,14 @@ in-band probe at all (#7481).
   and shared. A slow-but-reachable endpoint in a long chain can be cut off; size
   `HERMES_WEBUI_MODELS_REBUILD_BUDGET` for the endpoints actually in use, or give a
   `custom_providers` entry a static `models:` allowlist so it is never probed live.
+- An endpoint is probed **at most once per rebuild**. The three live-probe consumers
+  (active `model.base_url`, named `custom_providers`, LM Studio provider-group fallback)
+  share a per-rebuild memo keyed by the endpoint URL plus the credential sent, so the
+  common config where the active endpoint and `providers.lmstudio.base_url` are the same
+  LAN host no longer pays that host's connect timeout twice, and two named entries on one
+  endpoint probe it once. A different URL — or the same URL with a different key, which can
+  change the outcome — is still its own probe, and the memo is consulted only after the
+  per-endpoint SSRF/authentication checks, so a call that would have been refused still is.
 - Probe order, per-endpoint SSRF and authentication rules, and the per-endpoint cap are
   preserved.
 
