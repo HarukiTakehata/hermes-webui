@@ -104,6 +104,8 @@ def isolate_models_catalog_state(monkeypatch, tmp_path):
     monkeypatch.setattr(cfg, "_available_models_live_rebuild_ts", 0.0, raising=False)
     monkeypatch.setattr(cfg, "_available_models_cache_source_fingerprint", None, raising=False)
     monkeypatch.setattr(cfg, "_cache_build_in_progress", False, raising=False)
+    monkeypatch.setattr(cfg, "_models_rebuild_seq", 0, raising=False)
+    monkeypatch.setattr(cfg, "_models_published_seq", 0, raising=False)
     monkeypatch.setattr(cfg, "cfg", {}, raising=False)
     # Any provider left in the catalog would otherwise shell out to the Hermes
     # CLI for a live id list; the rebuild must stay network-free apart from the
@@ -150,6 +152,27 @@ def _models_by_provider(catalog: dict) -> dict[str, list[str]]:
     return {
         group["provider_id"]: [_bare_id(m.get("id")) for m in group.get("models", [])]
         for group in catalog["groups"]
+    }
+
+
+class _FakeClock:
+    """Stand-in for the ``time`` module so a schedule can be advanced by hand."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+
+def _catalog(name: str) -> dict:
+    """A minimal catalog tagged so a test can tell which build produced it."""
+    return {
+        "active_provider": name,
+        "default_model": f"{name}/model",
+        "configured_model_badges": {},
+        "groups": [{"provider": name.title(), "provider_id": name, "models": []}],
+        "aliases": {},
     }
 
 
@@ -280,13 +303,7 @@ def test_probe_schedule_shares_the_window_and_reserves_headroom(monkeypatch):
     monkeypatch.setattr(cfg, "_LIVE_REBUILD_BUDGET_SECONDS", 4.0, raising=False)
     monkeypatch.setattr(cfg, "CUSTOM_MODELS_ENDPOINT_TIMEOUT_SECONDS", 5.0, raising=False)
 
-    class _Clock:
-        now = 0.0
-
-        def monotonic(self):  # noqa: D102 - stand-in for time.monotonic
-            return self.now
-
-    clock = _Clock()
+    clock = _FakeClock()
     monkeypatch.setattr(cfg, "time", clock, raising=False)
 
     schedule = cfg._CustomProbeSchedule(4)
@@ -302,6 +319,28 @@ def test_probe_schedule_shares_the_window_and_reserves_headroom(monkeypatch):
     assert clock.now < 4.0, timeouts
 
 
+def test_probe_schedule_cannot_outspend_the_window_at_any_chain_length(monkeypatch):
+    """The headroom must survive long chains — `custom_providers` is unbounded.
+
+    Regression guard for the review finding on the first revision: a fixed 0.5s
+    per-probe floor let eight timeouts spend the whole four-second window and
+    nine spend past it, so a long chain of dead endpoints could still push a
+    reachable provider out of the in-band rebuild.
+    """
+    monkeypatch.setattr(cfg, "_LIVE_REBUILD_BUDGET_SECONDS", 4.0, raising=False)
+    monkeypatch.setattr(cfg, "CUSTOM_MODELS_ENDPOINT_TIMEOUT_SECONDS", 5.0, raising=False)
+
+    clock = _FakeClock()
+    monkeypatch.setattr(cfg, "time", clock, raising=False)
+
+    for endpoint_count in (1, 2, 8, 24):
+        clock.now = 0.0
+        schedule = cfg._CustomProbeSchedule(endpoint_count)
+        for _ in range(endpoint_count):
+            clock.now += schedule.next_timeout()  # every probe burns its slice
+        assert clock.now < 4.0, (endpoint_count, clock.now)
+
+
 def test_probe_schedule_restores_the_cap_once_the_budget_is_spent(monkeypatch):
     """The out-of-band continuation still gets a full attempt to refresh."""
     monkeypatch.setattr(cfg, "_LIVE_REBUILD_BUDGET_SECONDS", 0.05, raising=False)
@@ -313,33 +352,24 @@ def test_probe_schedule_restores_the_cap_once_the_budget_is_spent(monkeypatch):
     assert schedule.next_timeout() == 5.0
 
 
-def test_late_out_of_band_result_cannot_overwrite_a_newer_generation(
+def test_late_out_of_band_result_cannot_overwrite_a_newer_rebuild(
     monkeypatch, isolate_models_catalog_state
 ):
     """A superseded rebuild must not resurrect its catalog over a newer one."""
     _configure(monkeypatch, active_base_url=None)
     monkeypatch.setattr(cfg, "_LIVE_REBUILD_BUDGET_SECONDS", 0.05, raising=False)
 
-    newer = {
-        "active_provider": "newer-generation",
-        "default_model": "newer-generation/model",
-        "configured_model_badges": {},
-        "groups": [{"provider": "Newer", "provider_id": "newer-generation", "models": []}],
-        "aliases": {},
-    }
-    older = {
-        "active_provider": "older-generation",
-        "default_model": "older-generation/model",
-        "configured_model_badges": {},
-        "groups": [{"provider": "Older", "provider_id": "older-generation", "models": []}],
-        "aliases": {},
-    }
+    newer = _catalog("newer")
+    older = _catalog("older")
     finished = {"value": False}
 
     def _slow_builder(_builder):
-        # Still running when the foreground gives up — and by now a newer
-        # generation has been published (the out-of-band race).
+        # Still running when the foreground gives up — and by now a NEWER
+        # rebuild has been allocated and published its catalog (the out-of-band
+        # race the guard exists for).
         time.sleep(0.15)
+        cfg._models_rebuild_seq += 1
+        cfg._models_published_seq = cfg._models_rebuild_seq
         cfg._available_models_cache = newer
         cfg._available_models_cache_ts = time.monotonic()
         cfg._available_models_live_rebuild_ts = time.monotonic()
@@ -358,5 +388,43 @@ def test_late_out_of_band_result_cannot_overwrite_a_newer_generation(
 
     assert finished["value"] is True
     assert cfg._available_models_cache is newer, (
-        "the superseded out-of-band rebuild overwrote a newer catalog generation"
+        "the superseded out-of-band rebuild overwrote a newer catalog"
     )
+
+
+def test_older_publish_does_not_cost_a_newer_rebuild_its_result(
+    monkeypatch, isolate_models_catalog_state
+):
+    """An older build publishing late must not suppress the newer build's publish.
+
+    Regression guard for the review finding on the first revision: ordering by
+    wall-clock stamp meant an OLDER rebuild that published *after* a newer one
+    had started read as the newer generation, so the newer build's correct result
+    was discarded — leaving a stale catalog in the cache and disk while its
+    caller received a catalog that was never published.
+    """
+    _configure(monkeypatch, active_base_url=None)
+    monkeypatch.setattr(cfg, "_LIVE_REBUILD_BUDGET_SECONDS", 5.0, raising=False)
+
+    newer = _catalog("newer")
+    older = _catalog("older")
+
+    def _builder(_builder):
+        # This run is rebuild N; simulate rebuild N-1 publishing its older
+        # catalog late, while we are still building.
+        cfg._models_published_seq = cfg._models_rebuild_seq - 1
+        cfg._available_models_cache = older
+        cfg._available_models_cache_ts = time.monotonic()
+        cfg._available_models_live_rebuild_ts = time.monotonic()
+        return copy.deepcopy(newer)
+
+    monkeypatch.setattr(cfg, "_invoke_models_rebuild", _builder)
+
+    result = cfg.get_available_models()
+
+    assert result["active_provider"] == "newer"
+    assert cfg._available_models_cache is not older, (
+        "an older publish suppressed the newer rebuild's result"
+    )
+    assert cfg._available_models_cache["active_provider"] == "newer"
+    assert cfg._models_published_seq == cfg._models_rebuild_seq

@@ -98,11 +98,13 @@ logger = logging.getLogger(__name__)
 # short hard cap and graceful degradation.
 CUSTOM_MODELS_ENDPOINT_TIMEOUT_SECONDS = 5.0
 
-# Floor for the fair-share slice handed to a probe in the serial custom-endpoint
-# chain (see ``_CustomProbeSchedule``, #7481). A slice that rounded down to ~0
-# would turn a reachable provider into a guaranteed failure, so every probe
-# still gets at least this long before the chain stops handing out real attempts.
-CUSTOM_MODELS_MIN_PROBE_TIMEOUT_SECONDS = 0.5
+# Smallest slice ``_CustomProbeSchedule`` will hand a probe: a zero (or negative)
+# timeout means "non-blocking" to urllib, so a probe that is legitimately still in
+# flight would be reported as an instant connection failure. This is a guard rail
+# for the arithmetic — deliberately tiny, and NOT a per-probe minimum, because a
+# real floor would let a long chain of dead endpoints spend past the rebuild
+# window and recreate exactly the starvation this schedule exists to prevent.
+CUSTOM_MODELS_MIN_PROBE_TIMEOUT_SECONDS = 0.01
 
 
 def _env_mb_bytes(name: str, default_mb: int) -> int:
@@ -5157,6 +5159,31 @@ _available_models_cache_lock = threading.RLock()  # must be RLock: cold path ref
 _cache_build_cv = threading.Condition(_available_models_cache_lock)  # shares underlying RLock so notify_all() is safe inside with _available_models_cache_lock
 _cache_build_in_progress = False  # True while a cold path is actively building
 
+# ── Catalog publication ordering ─────────────────────────────────────────────
+# Every cold rebuild takes the next sequence number, and the published catalog
+# remembers the sequence it came from. A build may publish only if it is newer
+# than whatever is already published. That is what stops an over-budget worker
+# finishing late — the out-of-band publisher, which outlives the foreground
+# caller that gave up on it — from resurrecting a superseded catalog over a
+# newer one. Wall-clock stamps cannot express this ordering: an OLDER build can
+# publish *after* a newer build has already started, and a time comparison would
+# read that publication as "newer" and wrongly discard the newer build's result
+# (#7481 review).
+_models_rebuild_seq: int = 0
+_models_published_seq: int = 0
+
+
+def _allocate_models_rebuild_seq() -> int:
+    """Take the next catalog-rebuild sequence number.
+
+    The caller must hold ``_available_models_cache_lock`` (the cold path does),
+    so the counter is never advanced by two builds at once.
+    """
+    global _models_rebuild_seq
+    _models_rebuild_seq += 1
+    return _models_rebuild_seq
+
+
 # Memoized (snapshot_ref, {provider_slug: frozenset(model_ids)}) derived from
 # the published models-catalog snapshot. Used by _endpoint_advertised_model_ids
 # to answer "did this endpoint actually advertise this exact id?" in O(1) per
@@ -5316,8 +5343,14 @@ class _CustomProbeSchedule:
       the foreground caller already gave up — its probes are no longer holding
       anyone up and must keep their full attempt so the refresh can complete.
 
-    The only change in the single-endpoint case is that its probe is now bounded
-    by the rebuild window it shares, instead of being allowed to outlive it.
+    The trade-off to know about: slices shrink as the chain grows, because the
+    window is fixed and shared. A slow-but-reachable endpoint sitting in a long
+    chain can therefore be cut off; raise ``HERMES_WEBUI_MODELS_REBUILD_BUDGET``
+    for the endpoints actually in use, or give a ``custom_providers`` entry a
+    static ``models:`` allowlist so it is never probed live. What does NOT change
+    for any chain length is the total: the probes can never between them spend
+    past the window, so the foreground caller still receives a published catalog
+    rather than the over-budget fallback.
     """
 
     def __init__(self, endpoint_count: int) -> None:
@@ -5339,13 +5372,14 @@ class _CustomProbeSchedule:
         left = self._deadline - time.monotonic()
         if left <= 0:
             return self._cap
-        # ``remaining + 1`` rather than ``remaining``: the extra slot is the
-        # headroom that lets the whole chain finish *inside* the window instead
-        # of draining it to the last millisecond and tipping the foreground
-        # caller onto the fallback anyway. With N probes the chain can spend at
-        # most N/(N+1) of the budget, so even a probe that burns its whole slice
-        # leaves the rebuild room to publish in-band.
-        return max(self._min, min(self._cap, left / (remaining + 1)))
+        # ``remaining + 1`` reserves one slot of headroom, so a chain of N probes
+        # can spend at most N/(N+1) of the window and always finishes inside it —
+        # which is what keeps the foreground caller on a published catalog rather
+        # than the over-budget fallback. Clamping the guard against ``left`` keeps
+        # that true at every chain length: a probe can never be handed more time
+        # than the window has left, so the floor can't defeat the headroom.
+        slice_seconds = left / (remaining + 1)
+        return min(self._cap, max(slice_seconds, min(self._min, left)))
 
 
 # ── Budget-exceeded warning rate-limit ───────────────────────────────────────
@@ -6930,6 +6964,7 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
     """
     global _cache_build_in_progress, _available_models_cache, _available_models_cache_ts
     global _available_models_live_rebuild_ts, _available_models_cache_source_fingerprint, _cache_build_cv
+    global _models_published_seq
     # Config mtime check — must come before any config reads.
     # (Test #585 verifies _current_mtime appears before active_provider = None)
     try:
@@ -8632,6 +8667,11 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
         # Cold path: full rebuild — only one thread reaches here at a time
         with _cache_build_cv:
             _cache_build_in_progress = True
+        # This build's position in the publication order. Taken while holding
+        # _available_models_cache_lock (above), so no two builds can share one,
+        # and used to keep a late out-of-band publisher from overwriting a newer
+        # catalog (#7481).
+        rebuild_seq = _allocate_models_rebuild_seq()
 
         # Capture the active per-request profile (#3957). The live provider
         # probe inside the rebuild resolves credentials from os.environ /
@@ -8681,6 +8721,7 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                 _available_models_cache_ts = published_at
                 _available_models_live_rebuild_ts = published_at
                 _available_models_cache_source_fingerprint = _models_cache_source_fingerprint()
+                _models_published_seq = rebuild_seq
                 _sync_models_cache_provenance()
             try:
                 _save_models_cache_to_disk(result)
@@ -8718,31 +8759,29 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
         budget_exceeded = threading.Event()
         publish_lock = threading.Lock()
         box: dict = {}
-        # #7481: the moment this rebuild started. A published catalog whose
-        # live-rebuild stamp is newer than this belongs to a strictly newer
-        # generation and must never be overwritten by this (older) result.
-        rebuild_started_at = time.monotonic()
 
-        def _publish_models_result(result, *, build_started_at: float):
+        def _publish_models_result(result, *, rebuild_seq: int):
             global _cache_build_in_progress, _available_models_cache
             global _available_models_cache_ts, _available_models_live_rebuild_ts
-            global _available_models_cache_source_fingerprint
+            global _available_models_cache_source_fingerprint, _models_published_seq
             with _cache_build_cv:
-                if _available_models_live_rebuild_ts > build_started_at:
-                    # #7481 failure isolation: a newer catalog generation was
-                    # published while this build was still running. Only the
-                    # out-of-band publisher can reach this — it outlives the
-                    # foreground caller that already gave up on it — and
-                    # publishing our older result now would resurrect a
-                    # superseded catalog. Drop it. The newer publish already
-                    # released _cache_build_in_progress (every writer of
-                    # _available_models_live_rebuild_ts clears it), so the flag
-                    # is deliberately left alone rather than released for a
-                    # build that may not be ours.
+                if rebuild_seq < _models_published_seq:
+                    # #7481 failure isolation: the cache already holds a catalog
+                    # from a newer rebuild, so this one is superseded and must
+                    # not overwrite it. Only the out-of-band publisher can reach
+                    # this — it outlives the foreground caller that gave up on
+                    # it. Ordered by rebuild sequence, not by wall clock: an
+                    # older build can publish *after* a newer build started, and
+                    # a timestamp comparison would misread that as newer and drop
+                    # the newer result instead. The newer publish already
+                    # released _cache_build_in_progress, so the flag is
+                    # deliberately left alone rather than released for a build
+                    # that may not be ours.
                     logger.debug(
                         "discarding superseded models-catalog rebuild result "
-                        "(%.3fs older than the published generation)",
-                        _available_models_live_rebuild_ts - build_started_at,
+                        "(rebuild #%d, catalog published by rebuild #%d)",
+                        rebuild_seq,
+                        _models_published_seq,
                     )
                     return
                 published_at = time.monotonic()
@@ -8752,6 +8791,7 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                 _available_models_cache_source_fingerprint = (
                     _models_cache_source_fingerprint()
                 )
+                _models_published_seq = rebuild_seq
                 _sync_models_cache_provenance()
             try:
                 _save_models_cache_to_disk(result)
@@ -8803,7 +8843,7 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                     if budget_exceeded.is_set() and _claim_publish():
                         if "result" in box:
                             _publish_models_result(
-                                box["result"], build_started_at=rebuild_started_at
+                                box["result"], rebuild_seq=rebuild_seq
                             )
                         else:
                             _clear_build_in_progress()
@@ -8822,7 +8862,7 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                 _clear_build_in_progress()
                 raise box["error"]
             if _claim_publish():
-                _publish_models_result(box["result"], build_started_at=rebuild_started_at)
+                _publish_models_result(box["result"], rebuild_seq=rebuild_seq)
             return copy.deepcopy(box["result"])
 
         # Budget elapsed. Mark it so the worker knows it owns out-of-band
@@ -8832,7 +8872,7 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
         budget_exceeded.set()
         if build_done.is_set() and "error" not in box and "result" in box:
             if _claim_publish():
-                _publish_models_result(box["result"], build_started_at=rebuild_started_at)
+                _publish_models_result(box["result"], rebuild_seq=rebuild_seq)
             return copy.deepcopy(box["result"])
 
         # Genuinely slow/hung probe: serve the best fallback now; the worker

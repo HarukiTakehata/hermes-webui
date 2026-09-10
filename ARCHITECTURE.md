@@ -418,6 +418,53 @@ whose default `SessionDB()` path remains frozen at module import. Keep this fall
 compatibility-only: new goal semantics belong in Hermes Agent's native manager rather
 than a second WebUI implementation.
 
+### 4.9 Model Catalog Rebuild Budget and Probe Scheduling
+
+The model picker's catalog (`GET /api/models`) is produced by one cold rebuild that
+live-probes providers. A probe is a network call to a provider the WebUI may not be able
+to reach — a LAN LM Studio/Ollama host is the usual case, because the probe runs in the
+server process rather than the browser — so the rebuild runs on a daemon worker under a
+wall-clock budget:
+
+| Knob | Default | Meaning |
+| --- | --- | --- |
+| `HERMES_WEBUI_MODELS_REBUILD_BUDGET` | `4` (seconds) | Window a foreground caller waits for a cold rebuild. `0` restores the legacy synchronous unbounded rebuild. |
+| `CUSTOM_MODELS_ENDPOINT_TIMEOUT_SECONDS` | `5.0` | Per-endpoint cap for a custom provider `/v1/models` probe. |
+| `CUSTOM_MODELS_MIN_PROBE_TIMEOUT_SECONDS` | `0.01` | Arithmetic guard against a zero timeout. Not a per-probe minimum — see below. |
+
+Within the window the rebuild behaves normally; past it the caller is served a fallback
+(last-known disk cache, else a network-free static catalog) while the worker keeps going so
+the refresh lands out-of-band for the next caller.
+
+Custom endpoints are probed **serially**: the active `model.base_url` first, then each
+named `custom_providers` entry in config order, then the LM Studio provider-group
+fallback. `_CustomProbeSchedule` in `api/config.py` hands each of those probes a fair
+slice of the *remaining* window instead of letting one probe take the whole per-endpoint
+cap, so an unreachable endpoint cannot leave the reachable providers behind it with no
+in-band probe at all (#7481).
+
+- Each slice is `min(cap, left / (remaining + 1))`. The `+1` reserves a slot of headroom,
+  so a chain of N probes can spend at most `N/(N+1)` of the window and always finishes
+  inside it — that is what keeps the foreground caller on a published catalog instead of
+  the over-budget fallback. The guard above is clamped against `left`, so no chain length
+  can outspend the window.
+- Trade-off to know about: slices shrink as the chain grows, because the window is fixed
+  and shared. A slow-but-reachable endpoint in a long chain can be cut off; size
+  `HERMES_WEBUI_MODELS_REBUILD_BUDGET` for the endpoints actually in use, or give a
+  `custom_providers` entry a static `models:` allowlist so it is never probed live.
+- The legacy unbounded path (budget `0`) and the out-of-band continuation (window already
+  spent) keep the unthrottled per-endpoint cap, so their behaviour is unchanged. Probe
+  order, per-endpoint SSRF and authentication rules, and the per-endpoint cap are
+  preserved.
+
+Publication is ordered by **generation, not by wall clock**. Each cold rebuild takes the
+next sequence number (`_allocate_models_rebuild_seq`), the published catalog records the
+sequence it came from (`_models_published_seq`), and a result is dropped if it is older
+than what is already published. This matters for the out-of-band publisher, which outlives
+the foreground caller: without the guard it could resurrect a superseded catalog over a
+newer one. A timestamp comparison cannot express the ordering, because an older build can
+publish *after* a newer build has already started.
+
 ---
 
 ## 5. Frontend Architecture: Current State
