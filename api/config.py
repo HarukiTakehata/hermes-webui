@@ -98,6 +98,12 @@ logger = logging.getLogger(__name__)
 # short hard cap and graceful degradation.
 CUSTOM_MODELS_ENDPOINT_TIMEOUT_SECONDS = 5.0
 
+# Floor for the fair-share slice handed to a probe in the serial custom-endpoint
+# chain (see ``_CustomProbeSchedule``, #7481). A slice that rounded down to ~0
+# would turn a reachable provider into a guaranteed failure, so every probe
+# still gets at least this long before the chain stops handing out real attempts.
+CUSTOM_MODELS_MIN_PROBE_TIMEOUT_SECONDS = 0.5
+
 
 def _env_mb_bytes(name: str, default_mb: int) -> int:
     """Parse an optional megabyte environment variable into bytes.
@@ -5285,6 +5291,63 @@ except (TypeError, ValueError):
     _LIVE_REBUILD_BUDGET_SECONDS = 4.0
 
 
+class _CustomProbeSchedule:
+    """Fair-share timing for the serial custom-endpoint probe chain (#7481).
+
+    The cold model-catalog rebuild probes the active endpoint first and each
+    named ``custom_providers`` entry after it, serially, and every probe in the
+    chain shares the one ``_LIVE_REBUILD_BUDGET_SECONDS`` wall-clock budget
+    while individually being capped at ``CUSTOM_MODELS_ENDPOINT_TIMEOUT_SECONDS``.
+    One unreachable endpoint — a LAN LM Studio/Ollama host the webui container
+    cannot route to is the common case, since the probe runs server-side —
+    therefore used to spend the entire budget on its connect timeout, and every
+    reachable provider scheduled behind it never got an in-band ``/v1/models``
+    probe at all: its group rendered from a stale disk cache or stayed empty and
+    the whole rebuild was pushed out-of-band.
+
+    This schedule hands each probe a fair slice of the *remaining* budget rather
+    than letting it consume the whole cap, so an endpoint that times out cannot
+    starve the endpoints after it. Two cases intentionally keep the historical
+    unthrottled cap:
+
+    * the legacy unbounded path (``_LIVE_REBUILD_BUDGET_SECONDS <= 0``), where
+      there is no window to share;
+    * the out-of-band continuation, i.e. the rebuild worker still running after
+      the foreground caller already gave up — its probes are no longer holding
+      anyone up and must keep their full attempt so the refresh can complete.
+
+    The only change in the single-endpoint case is that its probe is now bounded
+    by the rebuild window it shares, instead of being allowed to outlive it.
+    """
+
+    def __init__(self, endpoint_count: int) -> None:
+        self._remaining = max(1, int(endpoint_count))
+        self._cap = float(CUSTOM_MODELS_ENDPOINT_TIMEOUT_SECONDS)
+        self._min = float(CUSTOM_MODELS_MIN_PROBE_TIMEOUT_SECONDS)
+        self._deadline = (
+            time.monotonic() + float(_LIVE_REBUILD_BUDGET_SECONDS)
+            if _LIVE_REBUILD_BUDGET_SECONDS > 0
+            else None
+        )
+
+    def next_timeout(self) -> float:
+        """Timeout for the next probe in the chain, then advance the schedule."""
+        remaining = self._remaining
+        self._remaining = max(1, remaining - 1)
+        if self._deadline is None:
+            return self._cap
+        left = self._deadline - time.monotonic()
+        if left <= 0:
+            return self._cap
+        # ``remaining + 1`` rather than ``remaining``: the extra slot is the
+        # headroom that lets the whole chain finish *inside* the window instead
+        # of draining it to the last millisecond and tipping the foreground
+        # caller onto the fallback anyway. With N probes the chain can spend at
+        # most N/(N+1) of the budget, so even a probe that burns its whole slice
+        # leaves the rebuild room to publish in-band.
+        return max(self._min, min(self._cap, left / (remaining + 1)))
+
+
 # ── Budget-exceeded warning rate-limit ───────────────────────────────────────
 # Q-2979-A3 / Copilot discussion_r3305864400: the live-rebuild-budget-exceeded
 # warning at _invoke_models_rebuild's slow-path is potentially high-volume —
@@ -7434,6 +7497,7 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
             *,
             api_key: object = "",
             trusted_base_urls: tuple[object, ...] = (),
+            timeout_seconds: float | None = None,
         ) -> tuple[list[dict], dict | None]:
             base = str(base_url or "").strip()
             if not base:
@@ -7484,7 +7548,16 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                 req.add_header("User-Agent", "OpenAI/Python 1.0")
                 for k, v in headers.items():
                     req.add_header(k, v)
-                with urllib.request.urlopen(req, timeout=CUSTOM_MODELS_ENDPOINT_TIMEOUT_SECONDS) as response:  # nosec B310
+                # #7481: the caller may hand us a fair-share slice of the shared
+                # rebuild budget (see _CustomProbeSchedule) instead of the full
+                # per-endpoint cap, so one unreachable endpoint cannot starve the
+                # providers probed after it. Default stays the documented cap.
+                probe_timeout = (
+                    CUSTOM_MODELS_ENDPOINT_TIMEOUT_SECONDS
+                    if timeout_seconds is None
+                    else float(timeout_seconds)
+                )
+                with urllib.request.urlopen(req, timeout=probe_timeout) as response:  # nosec B310
                     data = json.loads(response.read().decode("utf-8"))
                 return _extract_model_entries_from_payload(data, provider), None
             except urllib.error.HTTPError as exc:
@@ -7495,6 +7568,52 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                 error = _custom_endpoint_error(provider, exc)
                 logger.debug("Custom endpoint unreachable or misconfigured for provider %s: %s", provider, error)
                 return [], error
+
+        # ── Fair-share schedule for the serial custom-endpoint probe chain ───
+        # #7481: step 4 probes the active endpoint and step 5 probes each named
+        # ``custom_providers`` entry after it, serially, off one shared rebuild
+        # budget. Without a schedule the first endpoint in the chain could spend
+        # that entire budget on its own connect timeout and leave every later —
+        # reachable — provider with no in-band probe at all. See
+        # _CustomProbeSchedule for the allocation rules.
+        def _pending_custom_probe_count() -> int:
+            """How many endpoints this rebuild is about to probe live, in order.
+
+            Counts the active endpoint (step 4) plus the named
+            ``custom_providers`` entries that will need a live ``/v1/models``
+            probe (step 5). Providers carrying a static ``models:`` allowlist
+            never probe live, so they must not dilute the schedule. Entries
+            whose base_url is only resolvable later from the credential pool are
+            counted anyway — over-counting merely makes the earlier slices a
+            little smaller, whereas under-counting would over-spend the budget.
+            """
+            count = 1 if cfg_base_url else 0
+            custom_providers_cfg = cfg.get("custom_providers", [])
+            if isinstance(custom_providers_cfg, list):
+                for entry in custom_providers_cfg:
+                    if not isinstance(entry, dict):
+                        continue
+                    if not (entry.get("name") or "").strip():
+                        continue
+                    configured_models = entry.get("models")
+                    if isinstance(configured_models, (dict, list)) and len(configured_models) > 0:
+                        continue
+                    count += 1
+            # The LM Studio provider-group branch re-probes the same
+            # /v1/models endpoint from ``providers.lmstudio.base_url`` in its own
+            # right — the second consumer of a single dead LAN endpoint in the
+            # common #7481 config — so it has to hold a slot in the schedule too.
+            # When the hermes_cli tier answers first no HTTP probe happens and
+            # the slot simply goes unused, which only makes the earlier slices a
+            # touch smaller.
+            if (
+                "lmstudio" in {str(pid).strip().lower() for pid in detected_providers}
+                and _get_provider_base_url("lmstudio")
+            ):
+                count += 1
+            return count
+
+        custom_probe_schedule = _CustomProbeSchedule(_pending_custom_probe_count())
 
         # 4. Fetch models from custom endpoint if base_url is configured
         auto_detected_models = []
@@ -7570,6 +7689,7 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                 provider,
                 api_key=api_key,
                 trusted_base_urls=tuple(_trusted_custom_bases),
+                timeout_seconds=custom_probe_schedule.next_timeout(),
             )
             for auto_model in _active_endpoint_models:
                 auto_detected_models.append(auto_model)
@@ -7643,6 +7763,7 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                             _slug,
                             api_key=_cp_api_key,
                             trusted_base_urls=(_cp_base_url,),
+                            timeout_seconds=custom_probe_schedule.next_timeout(),
                         )
                     if _live_error:
                         _named_custom_errors[_slug] = _live_error
@@ -8104,7 +8225,14 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                             try:
                                 import urllib.request as _urlreq
                                 req = _urlreq.Request(endpoint, method="GET", headers=headers)
-                                with _urlreq.urlopen(req, timeout=5) as resp:
+                                # #7481: this probe is part of the same rebuild as
+                                # the custom-endpoint chain, so it draws from the
+                                # shared schedule instead of a hardcoded 5s that
+                                # could push the rebuild past the budget on its own.
+                                with _urlreq.urlopen(
+                                    req,
+                                    timeout=custom_probe_schedule.next_timeout(),
+                                ) as resp:
                                     lm_data = json.loads(resp.read().decode())
                                 for m in (lm_data.get("data") or []):
                                     if isinstance(m, dict):
@@ -8590,12 +8718,33 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
         budget_exceeded = threading.Event()
         publish_lock = threading.Lock()
         box: dict = {}
+        # #7481: the moment this rebuild started. A published catalog whose
+        # live-rebuild stamp is newer than this belongs to a strictly newer
+        # generation and must never be overwritten by this (older) result.
+        rebuild_started_at = time.monotonic()
 
-        def _publish_models_result(result):
+        def _publish_models_result(result, *, build_started_at: float):
             global _cache_build_in_progress, _available_models_cache
             global _available_models_cache_ts, _available_models_live_rebuild_ts
             global _available_models_cache_source_fingerprint
             with _cache_build_cv:
+                if _available_models_live_rebuild_ts > build_started_at:
+                    # #7481 failure isolation: a newer catalog generation was
+                    # published while this build was still running. Only the
+                    # out-of-band publisher can reach this — it outlives the
+                    # foreground caller that already gave up on it — and
+                    # publishing our older result now would resurrect a
+                    # superseded catalog. Drop it. The newer publish already
+                    # released _cache_build_in_progress (every writer of
+                    # _available_models_live_rebuild_ts clears it), so the flag
+                    # is deliberately left alone rather than released for a
+                    # build that may not be ours.
+                    logger.debug(
+                        "discarding superseded models-catalog rebuild result "
+                        "(%.3fs older than the published generation)",
+                        _available_models_live_rebuild_ts - build_started_at,
+                    )
+                    return
                 published_at = time.monotonic()
                 _available_models_cache = result
                 _available_models_cache_ts = published_at
@@ -8653,7 +8802,9 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                     # the correct profile's cache file.
                     if budget_exceeded.is_set() and _claim_publish():
                         if "result" in box:
-                            _publish_models_result(box["result"])
+                            _publish_models_result(
+                                box["result"], build_started_at=rebuild_started_at
+                            )
                         else:
                             _clear_build_in_progress()
 
@@ -8671,7 +8822,7 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
                 _clear_build_in_progress()
                 raise box["error"]
             if _claim_publish():
-                _publish_models_result(box["result"])
+                _publish_models_result(box["result"], build_started_at=rebuild_started_at)
             return copy.deepcopy(box["result"])
 
         # Budget elapsed. Mark it so the worker knows it owns out-of-band
@@ -8681,7 +8832,7 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
         budget_exceeded.set()
         if build_done.is_set() and "error" not in box and "result" in box:
             if _claim_publish():
-                _publish_models_result(box["result"])
+                _publish_models_result(box["result"], build_started_at=rebuild_started_at)
             return copy.deepcopy(box["result"])
 
         # Genuinely slow/hung probe: serve the best fallback now; the worker
