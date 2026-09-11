@@ -41,6 +41,19 @@ _GATEWAY_MODELS = ["gateway-model-a", "gateway-model-b"]
 _BUDGET = 4.0
 _CAP = 1.5
 
+# Deliberately widened budget/cap pair for the end-to-end publication assertion
+# (the repro test). The rebuild worker's deadline is a *real* OS-clock wait —
+# ``build_done.wait(timeout=_LIVE_REBUILD_BUDGET_SECONDS)`` in
+# ``get_available_models`` — which the injected ``_FakeClock`` cannot
+# virtualise, so on a slow runner the issue's 4s window can be crossed mid-build
+# and the over-budget fallback served without the gateway. Widening the window
+# makes the assertion depend on the fix rather than on the runner: the repro's
+# locally-served, non-sleeping probes finish in milliseconds against 40s, while
+# the "slice < cap" rule still holds — its three scheduled slots get
+# ``40 / (3 + 1) = 10 < 20``.
+_WIDE_BUDGET = 40.0
+_WIDE_CAP = 20.0
+
 
 class _FakeResponse:
     def __init__(self, payload: dict) -> None:
@@ -70,14 +83,17 @@ def _install_urlopen(monkeypatch, *, dead_hosts, live_hosts, clock=None):
     way these tests were not written to describe. Advancing the injected clock
     keeps the budget exact and the ordering assertions meaningful on any runner.
 
-    Returns ``{"dead": [(url, timeout)], "live": [(url, timeout)]}``.
+    Returns ``{"dead": [(url, timeout)], "live": [(url, timeout)],
+    "order": [url, ...]}`` — ``order`` is the flat probe sequence across both
+    categories, so a test can assert the visit order rather than only per-host.
     """
-    observed: dict[str, list] = {"dead": [], "live": []}
+    observed: dict[str, list] = {"dead": [], "live": [], "order": []}
 
     def fake_urlopen(req, timeout=None):
         url = str(getattr(req, "full_url", ""))
         if any(host in url for host in dead_hosts):
             observed["dead"].append((url, timeout))
+            observed["order"].append(url)
             if clock is not None:
                 clock.now += float(timeout or 0.0)
             else:
@@ -85,6 +101,7 @@ def _install_urlopen(monkeypatch, *, dead_hosts, live_hosts, clock=None):
             raise urllib.error.URLError("timed out")
         if any(host in url for host in live_hosts):
             observed["live"].append((url, timeout))
+            observed["order"].append(url)
             return _FakeResponse({"data": [{"id": mid} for mid in _GATEWAY_MODELS]})
         raise urllib.error.URLError(f"unexpected probe: {url}")
 
@@ -208,12 +225,28 @@ def test_unreachable_lan_active_endpoint_does_not_starve_the_gateway_behind_it(
     A dead LAN endpoint is configured both as the active provider and as
     ``providers.lmstudio`` (so the provider-group fallback probes it a second
     time). The reachable named gateway behind it must still get its in-band
-    probe and land in the catalog the caller receives — not merely be deferred
-    to an out-of-band refresh after a fallback was served.
+    probe — not merely be deferred to an out-of-band refresh after a fallback
+    was served.
 
-    Runs on the injected clock (maintainer review, 2026-09-10): the dead host
-    burns *virtual* time instead of really sleeping, so the budget arithmetic is
-    exact rather than dependent on how fast this runner happens to be.
+    Machine-speed independence (maintainer review, 2026-09-11). Installing
+    ``_FakeClock`` makes the *schedule's* window arithmetic exact, but the
+    budget is ultimately enforced by the rebuild worker's
+    ``build_done.wait(timeout=_LIVE_REBUILD_BUDGET_SECONDS)``, a real OS-clock
+    wait the injected clock cannot virtualise. On a slow runner the build can
+    therefore cross the 4s deadline mid-call, the foreground serves the
+    over-budget fallback, ``observed["live"]`` is empty and the gateway never
+    reaches the caller — a property of the runner, not of the fix. So this test
+    asserts the probe/scheduling invariants that the fake clock makes exact,
+    and takes the one end-to-end "lands in the caller's catalog" assertion under
+    a deliberately widened budget/cap pair (see ``_WIDE_BUDGET`` / ``_WIDE_CAP``)
+    whose real work finishes with a large margin.
+
+    The in-band publication itself is also covered, machine-independently, by
+    ``test_every_dead_endpoint_in_the_chain_still_lets_the_live_one_through``
+    and ``test_static_allowlist_provider_is_never_probed_and_does_not_dilute_the_schedule``;
+    if the widened pair ever proves flaky on a runner, drop the final catalog
+    assertion and keep the four invariants, relying on those two for
+    end-to-end coverage.
     """
     _configure(
         monkeypatch,
@@ -227,6 +260,12 @@ def test_unreachable_lan_active_endpoint_does_not_starve_the_gateway_behind_it(
             }
         ],
     )
+    # Widen the window for this test only: the schedule then computes its slices
+    # from a 40s budget while the per-endpoint cap is 20s, so the repro's three
+    # slots each get 10s (still strictly below the cap) and the call phase has an
+    # ≥8x real-time margin instead of racing the 4s deadline.
+    monkeypatch.setattr(cfg, "_LIVE_REBUILD_BUDGET_SECONDS", _WIDE_BUDGET, raising=False)
+    monkeypatch.setattr(cfg, "CUSTOM_MODELS_ENDPOINT_TIMEOUT_SECONDS", _WIDE_CAP, raising=False)
     clock = _FakeClock()
     monkeypatch.setattr(cfg, "time", clock, raising=False)
     observed = _install_urlopen(
@@ -238,24 +277,33 @@ def test_unreachable_lan_active_endpoint_does_not_starve_the_gateway_behind_it(
 
     catalog = cfg.get_available_models()
 
-    # The whole chain fitted inside the window, so the rebuild published in-band
-    # and no budget-exceeded fallback was served.
-    assert clock.now < _BUDGET, clock.now
-    assert observed["live"], "the reachable named provider was never probed"
-    assert _models_by_provider(catalog).get("custom:my-gateway") == _GATEWAY_MODELS
-
-    # The dead endpoint is configured twice (active `model.base_url` and
+    # (1) The dead endpoint is configured twice (active `model.base_url` and
     # `providers.lmstudio.base_url`), but it is now probed ONCE per rebuild: the
     # second consumer reuses the first outcome instead of paying the connect
-    # timeout again. Its single probe was still handed a bounded slice of the
-    # window rather than the whole per-endpoint cap.
+    # timeout again.
     assert len(observed["dead"]) == 1
-    for _url, timeout in observed["dead"]:
-        assert timeout is not None and 0 < timeout < _CAP
-    # The reachable provider was probed in-band off the same window, so its probe
-    # is bounded by the remaining budget too rather than the per-endpoint cap.
-    for _url, timeout in observed["live"]:
-        assert timeout is not None and 0 < timeout < _CAP
+
+    # (2) Probes are walked in config order — the active (`lan-dead`) endpoint
+    # before the named gateway — and the gateway really was probed in-band.
+    assert observed["live"], "the reachable named provider was never probed"
+    probed_hosts = [url.split("://", 1)[1].split("/", 1)[0] for url in observed["order"]]
+    assert probed_hosts == ["lan-dead.example:1234", "gw-live.example"], probed_hosts
+
+    # (3) Every probe was handed a bounded slice of the window — positive and
+    # strictly below the per-endpoint cap — rather than the whole cap.
+    for url, timeout in observed["dead"] + observed["live"]:
+        assert timeout is not None and 0 < timeout < _WIDE_CAP, (url, timeout)
+
+    # (4) The schedule's own arithmetic stayed inside the window. This is the
+    # virtual clock, so it states "the chain fitted inside the window" on any
+    # runner — the invariant the slow-runner failure violated via the real-clock
+    # fallback. (The catalogue the caller actually receives is asserted next,
+    # under the widened budget that removes the real-clock race.)
+    assert clock.now < _WIDE_BUDGET, clock.now
+
+    # (5) End-to-end: the reachable gateway lands in the catalog the caller
+    # receives rather than only in an out-of-band refresh after a fallback.
+    assert _models_by_provider(catalog).get("custom:my-gateway") == _GATEWAY_MODELS
 
 
 def test_every_dead_endpoint_in_the_chain_still_lets_the_live_one_through(
