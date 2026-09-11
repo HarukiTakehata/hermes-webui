@@ -56,12 +56,19 @@ class _FakeResponse:
         return self._body
 
 
-def _install_urlopen(monkeypatch, *, dead_hosts, live_hosts):
+def _install_urlopen(monkeypatch, *, dead_hosts, live_hosts, clock=None):
     """Route probes by host and record the timeout each one was handed.
 
     A "dead" host behaves the way an unreachable LAN endpoint does: it burns the
     entire timeout it was given and then fails — exactly the behaviour that used
     to eat the shared rebuild budget.
+
+    ``clock`` (a ``_FakeClock`` already installed as ``cfg.time``) makes that burn
+    *virtual* instead of real. A real sleep ties the budget arithmetic to how fast
+    the runner is: on a slower box the active endpoint's sleep crosses the 4s
+    deadline before the later endpoints are reached, so the chain is cut off in a
+    way these tests were not written to describe. Advancing the injected clock
+    keeps the budget exact and the ordering assertions meaningful on any runner.
 
     Returns ``{"dead": [(url, timeout)], "live": [(url, timeout)]}``.
     """
@@ -71,7 +78,10 @@ def _install_urlopen(monkeypatch, *, dead_hosts, live_hosts):
         url = str(getattr(req, "full_url", ""))
         if any(host in url for host in dead_hosts):
             observed["dead"].append((url, timeout))
-            time.sleep(timeout if timeout is not None else 10)
+            if clock is not None:
+                clock.now += float(timeout or 0.0)
+            else:
+                time.sleep(timeout if timeout is not None else 10)
             raise urllib.error.URLError("timed out")
         if any(host in url for host in live_hosts):
             observed["live"].append((url, timeout))
@@ -157,13 +167,26 @@ def _models_by_provider(catalog: dict) -> dict[str, list[str]]:
 
 
 class _FakeClock:
-    """Stand-in for the ``time`` module so a schedule can be advanced by hand."""
+    """Stand-in for the ``time`` module so a schedule can be advanced by hand.
+
+    Only ``monotonic()`` is virtual — that is the clock ``_CustomProbeSchedule``
+    measures the rebuild window with, and the one a mock probe advances when it
+    "burns" its slice. ``time()`` stays real so the epoch-based comparisons
+    elsewhere in the module (cache file ages, credential-pool TTLs) keep their
+    meaning; nothing in ``api/config.py`` calls ``time.sleep``.
+    """
 
     def __init__(self) -> None:
         self.now = 0.0
 
     def monotonic(self) -> float:
         return self.now
+
+    def time(self) -> float:
+        return time.time()
+
+    def sleep(self, seconds: float) -> None:
+        self.now += max(0.0, float(seconds))
 
 
 def _catalog(name: str) -> dict:
@@ -187,6 +210,10 @@ def test_unreachable_lan_active_endpoint_does_not_starve_the_gateway_behind_it(
     time). The reachable named gateway behind it must still get its in-band
     probe and land in the catalog the caller receives — not merely be deferred
     to an out-of-band refresh after a fallback was served.
+
+    Runs on the injected clock (maintainer review, 2026-09-10): the dead host
+    burns *virtual* time instead of really sleeping, so the budget arithmetic is
+    exact rather than dependent on how fast this runner happens to be.
     """
     _configure(
         monkeypatch,
@@ -200,16 +227,20 @@ def test_unreachable_lan_active_endpoint_does_not_starve_the_gateway_behind_it(
             }
         ],
     )
+    clock = _FakeClock()
+    monkeypatch.setattr(cfg, "time", clock, raising=False)
     observed = _install_urlopen(
-        monkeypatch, dead_hosts=["lan-dead.example"], live_hosts=["gw-live.example"]
+        monkeypatch,
+        dead_hosts=["lan-dead.example"],
+        live_hosts=["gw-live.example"],
+        clock=clock,
     )
 
-    started = time.monotonic()
     catalog = cfg.get_available_models()
-    elapsed = time.monotonic() - started
 
-    # The rebuild published in-band: no budget-exceeded fallback was served.
-    assert elapsed < _BUDGET
+    # The whole chain fitted inside the window, so the rebuild published in-band
+    # and no budget-exceeded fallback was served.
+    assert clock.now < _BUDGET, clock.now
     assert observed["live"], "the reachable named provider was never probed"
     assert _models_by_provider(catalog).get("custom:my-gateway") == _GATEWAY_MODELS
 
@@ -230,7 +261,13 @@ def test_unreachable_lan_active_endpoint_does_not_starve_the_gateway_behind_it(
 def test_every_dead_endpoint_in_the_chain_still_lets_the_live_one_through(
     monkeypatch, isolate_models_catalog_state
 ):
-    """Two dead named providers in front of a reachable one must not starve it."""
+    """Two dead named providers in front of a reachable one must not starve it.
+
+    Also on the injected clock (maintainer review, 2026-09-10): with real sleeps
+    the active endpoint's sleep could cross the 4s deadline before ``dead-one`` /
+    ``dead-two`` were reached on a slower box, so the ordering assertion this test
+    exists for was decided by the runner's speed.
+    """
     _configure(
         monkeypatch,
         active_base_url="http://lan-dead.example:1234/v1",
@@ -240,22 +277,31 @@ def test_every_dead_endpoint_in_the_chain_still_lets_the_live_one_through(
             {"name": "My Gateway", "base_url": "https://gw-live.example/v1", "api_key": "k3"},
         ],
     )
+    clock = _FakeClock()
+    monkeypatch.setattr(cfg, "time", clock, raising=False)
     observed = _install_urlopen(
         monkeypatch,
         dead_hosts=["lan-dead.example", "dead-one.example", "dead-two.example"],
         live_hosts=["gw-live.example"],
+        clock=clock,
     )
 
     catalog = cfg.get_available_models()
 
-    # Every named endpoint was attempted, in config order, before the budget
-    # ran out (the active endpoint may additionally be re-probed by the LM
-    # Studio provider-group fallback, which is the same window).
+    # Every endpoint was attempted, in config order, before the budget ran out:
+    # the active endpoint first, then the named entries. The LM Studio
+    # provider-group fallback resolves to the active endpoint's URL here and
+    # reuses that probe's outcome (same URL, same credential) rather than
+    # repeating it, so it adds no third probe of the dead host.
     probed_hosts = [url.split("://", 1)[1].split("/", 1)[0] for url, _ in observed["dead"]]
-    assert [host for host in probed_hosts if host != "lan-dead.example:1234"] == [
+    assert probed_hosts == [
+        "lan-dead.example:1234",
         "dead-one.example",
         "dead-two.example",
-    ]
+    ], probed_hosts
+    # …and the chain still finished inside the window, so the live provider behind
+    # the dead ones was probed in-band and published.
+    assert clock.now < _BUDGET, clock.now
     assert _models_by_provider(catalog).get("custom:my-gateway") == _GATEWAY_MODELS
 
 
