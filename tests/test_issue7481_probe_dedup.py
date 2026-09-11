@@ -16,16 +16,69 @@ different credential is still probed in its own right.
 
 from __future__ import annotations
 
+import socket
+
 import pytest
 
 import api.config as cfg
-from tests.test_issue7481_custom_probe_budget_fairness import (  # noqa: F401
+import api.profiles as profiles
+from tests.test_issue7481_custom_probe_budget_fairness import (
     _GATEWAY_MODELS,
     _configure,
     _install_urlopen,
     _models_by_provider,
-    isolate_models_catalog_state,
 )
+
+
+@pytest.fixture
+def isolate_models_catalog_state(monkeypatch, tmp_path):
+    """Hermetic catalog state, same harness as the sibling #7481 module.
+
+    Defined here rather than imported from there: a fixture imported purely so it
+    can be requested as a fixture reads as an unused import to linters (ruff F401)
+    and collides with the very parameters that request it (ruff F811). Each test
+    module owning its harness is what the rest of this suite does.
+    """
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("model: {}\n", encoding="utf-8")
+    auth_store_path = tmp_path / "auth.json"
+    auth_store_path.write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr(cfg, "_get_config_path", lambda: config_path)
+    monkeypatch.setattr(cfg, "_cfg_path", config_path, raising=False)
+    monkeypatch.setattr(cfg, "_cfg_mtime", config_path.stat().st_mtime, raising=False)
+    monkeypatch.setattr(cfg, "_cfg_has_in_memory_overrides", lambda: True)
+    monkeypatch.setattr(cfg, "_get_auth_store_path", lambda: auth_store_path)
+    monkeypatch.setattr(cfg, "_load_models_cache_from_disk", lambda: None)
+    monkeypatch.setattr(cfg, "_save_models_cache_to_disk", lambda *_a, **_k: None)
+    monkeypatch.setattr(cfg, "_get_models_cache_path", lambda: tmp_path / "models_cache.json")
+    monkeypatch.setattr(cfg, "_delete_models_cache_on_disk", lambda: None)
+    monkeypatch.setattr(cfg, "_models_cache_source_fingerprint", lambda: "issue-7481-fp")
+    monkeypatch.setattr(cfg, "_available_models_cache", None, raising=False)
+    monkeypatch.setattr(cfg, "_available_models_cache_ts", 0.0, raising=False)
+    monkeypatch.setattr(cfg, "_available_models_live_rebuild_ts", 0.0, raising=False)
+    monkeypatch.setattr(cfg, "_available_models_cache_source_fingerprint", None, raising=False)
+    monkeypatch.setattr(cfg, "_cache_build_in_progress", False, raising=False)
+    monkeypatch.setattr(cfg, "_models_rebuild_seq", 0, raising=False)
+    monkeypatch.setattr(cfg, "_models_published_seq", 0, raising=False)
+    monkeypatch.setattr(cfg, "cfg", {}, raising=False)
+    # Any provider left in the catalog would otherwise shell out to the Hermes
+    # CLI for a live id list; the rebuild must stay network-free apart from the
+    # custom endpoints under test.
+    monkeypatch.setattr(cfg, "_read_live_provider_model_ids", lambda _pid: [])
+    monkeypatch.setattr(profiles, "get_active_hermes_home", lambda: tmp_path / "hermes-home")
+    monkeypatch.setattr(cfg.os, "getenv", lambda key, default=None: default or "")
+    # The probe path resolves the endpoint hostname for its SSRF guard. A real
+    # resolver makes these tests depend on the host's DNS behaviour (and this
+    # container takes seconds to answer NXDOMAIN), so pin it to an immediate
+    # failure: the guard treats that as "not resolvable" and lets the probe
+    # through, which is exactly what the fake urlopen above is standing in for.
+    def _unresolvable(host, port, *args, **kwargs):
+        raise socket.gaierror("hermetic test resolver")
+
+    monkeypatch.setattr(socket, "getaddrinfo", _unresolvable)
+
+    return {"tmp_path": tmp_path, "auth_store_path": auth_store_path}
 
 
 def _hosts(observed, kind: str) -> list[str]:
