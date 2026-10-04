@@ -1,0 +1,61 @@
+name: PR7506 fork acceptance
+on:
+  push:
+    branches: [ci/pr7506-acceptance]
+permissions:
+  contents: read
+jobs:
+  serial-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: candidate
+            ref: c6b5b027c67a7f8b543d0af4659616b8f87eb57b
+          - label: baseline
+            ref: c261dff4ee4503cb58347a05b8bbad28f15bc5da
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.ref }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Install test dependencies
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install -r requirements-dev.txt playwright requests build setuptools setuptools-scm wheel
+          .venv/bin/python -m playwright install --with-deps chromium
+      - name: Environment and source identity
+        run: |
+          git rev-parse HEAD
+          node --version
+          .venv/bin/python --version
+          curl --version
+          command -v ps
+      - name: Full serial suite
+        env:
+          HERMES_HOME: ${{ runner.temp }}/hermes-test-home
+          HERMES_BASE_HOME: ${{ runner.temp }}/hermes-test-home
+          HERMES_WEBUI_STATE_DIR: ${{ runner.temp }}/webui-test-state
+          HERMES_WEBUI_TEST_STATE_DIR: ${{ runner.temp }}/server-test-state
+          CODEX_HOME: ${{ runner.temp }}/codex-test-home
+        run: |
+          mkdir -p "$HERMES_HOME" "$HERMES_WEBUI_STATE_DIR" "$HERMES_WEBUI_TEST_STATE_DIR" "$CODEX_HOME"
+          set -o pipefail
+          ./scripts/test.sh tests/ -q --timeout=120 --tb=short -ra --junitxml=results.xml 2>&1 | tee pytest.log
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr7506-${{ matrix.label }}
+          path: |
+            results.xml
+            pytest.log
+          if-no-files-found: warn
